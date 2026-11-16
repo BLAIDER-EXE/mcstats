@@ -40,6 +40,7 @@ public class StatsPlugin extends JavaPlugin implements Listener {
                 + "/" + c.getString("database.name");
         user = c.getString("database.user");
         pass = c.getString("database.password");
+        try { Class.forName("org.mariadb.jdbc.Driver"); } catch (ClassNotFoundException e) { getLogger().severe("MariaDB driver missing: " + e); }
         try (Connection t = conn()) {
             getLogger().info("Database connected.");
         } catch (SQLException e) {
