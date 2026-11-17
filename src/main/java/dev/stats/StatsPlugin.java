@@ -1,6 +1,7 @@
 package dev.stats;
 
 import org.bukkit.entity.Player;
+import org.bukkit.inventory.ItemStack;
 import org.bukkit.entity.Projectile;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -32,6 +33,9 @@ public class StatsPlugin extends JavaPlugin implements Listener {
     private final Map<UUID, String> names = new ConcurrentHashMap<>();
     private String url, user, pass;
 
+    record Snap(UUID id, byte[] inv, String invText, byte[] ec, String ecText) {}
+    private final Map<UUID, Snap> pendingSnaps = new ConcurrentHashMap<>();
+
     @Override
     public void onEnable() {
         saveDefaultConfig();
@@ -42,6 +46,7 @@ public class StatsPlugin extends JavaPlugin implements Listener {
         pass = c.getString("database.password");
         try { Class.forName("org.mariadb.jdbc.Driver"); } catch (ClassNotFoundException e) { getLogger().severe("MariaDB driver missing: " + e); }
         try (Connection t = conn()) {
+            ensureTables(t);
             getLogger().info("Database connected.");
         } catch (SQLException e) {
             getLogger().severe("DB connection failed: " + e.getMessage());
@@ -51,11 +56,25 @@ public class StatsPlugin extends JavaPlugin implements Listener {
         getServer().getPluginManager().registerEvents(this, this);
         long period = 20L * c.getInt("flush-seconds", 60);
         getServer().getScheduler().runTaskTimerAsynchronously(this, this::flushAll, period, period);
+        long invPeriod = 20L * c.getInt("inventory-save-seconds", 300);
+        getServer().getScheduler().runTaskTimer(this, () -> {
+            List<Snap> list = new ArrayList<>();
+            for (Player p : getServer().getOnlinePlayers()) list.add(snap(p));
+            async(() -> {
+                try (Connection cn = conn()) {
+                    for (Snap sn : list) saveSnap(cn, sn);
+                } catch (SQLException ex) { err(ex); }
+            });
+        }, invPeriod, invPeriod);
     }
 
     @Override
     public void onDisable() {
         flushAll();
+        try (Connection cn = conn()) {
+            for (Player p : getServer().getOnlinePlayers()) pendingSnaps.put(p.getUniqueId(), snap(p));
+            for (Snap sn : pendingSnaps.values()) saveSnap(cn, sn);
+        } catch (SQLException ex) { err(ex); }
     }
 
     private Connection conn() throws SQLException {
@@ -91,8 +110,12 @@ public class StatsPlugin extends JavaPlugin implements Listener {
     public void onQuit(PlayerQuitEvent e) {
         UUID id = e.getPlayer().getUniqueId();
         String ip = e.getPlayer().getAddress() != null ? e.getPlayer().getAddress().getAddress().getHostAddress() : null;
+        Snap sn = snap(e.getPlayer());
+        pendingSnaps.put(id, sn);
         async(() -> {
             try (Connection cn = conn()) {
+                saveSnap(cn, sn);
+                pendingSnaps.remove(id, sn);
                 flush(cn, id);
                 history(cn, id, "LEAVE", ip);
                 data.remove(id);
@@ -148,6 +171,40 @@ public class StatsPlugin extends JavaPlugin implements Listener {
                 ps.executeUpdate();
             } catch (SQLException ex) { err(ex); }
         });
+    }
+
+    // ---------- Inventory ----------
+
+    private Snap snap(Player p) {
+        ItemStack[] inv = p.getInventory().getContents();
+        ItemStack[] ec = p.getEnderChest().getContents();
+        return new Snap(p.getUniqueId(), ItemStack.serializeItemsAsBytes(inv), text(inv),
+                ItemStack.serializeItemsAsBytes(ec), text(ec));
+    }
+
+    private String text(ItemStack[] items) {
+        Map<String, Integer> m = new TreeMap<>();
+        for (ItemStack it : items)
+            if (it != null && !it.getType().isAir()) m.merge(it.getType().name(), it.getAmount(), Integer::sum);
+        StringJoiner j = new StringJoiner(", ");
+        m.forEach((k, v) -> j.add(k + " x" + v));
+        return j.toString();
+    }
+
+    private void saveSnap(Connection cn, Snap s) throws SQLException {
+        exec(cn, "INSERT INTO player_inventory(uuid,inventory_data,inventory_text,enderchest_data,enderchest_text) VALUES(?,?,?,?,?) "
+                + "ON DUPLICATE KEY UPDATE inventory_data=VALUES(inventory_data), inventory_text=VALUES(inventory_text), "
+                + "enderchest_data=VALUES(enderchest_data), enderchest_text=VALUES(enderchest_text)",
+                s.id().toString(), s.inv(), s.invText(), s.ec(), s.ecText());
+    }
+
+    private void ensureTables(Connection cn) throws SQLException {
+        try (Statement st = cn.createStatement()) {
+            st.executeUpdate("CREATE TABLE IF NOT EXISTS player_inventory ("
+                    + "uuid CHAR(36) PRIMARY KEY, inventory_data LONGBLOB, inventory_text TEXT, "
+                    + "enderchest_data LONGBLOB, enderchest_text TEXT, "
+                    + "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+        }
     }
 
     // ---------- DB ----------
