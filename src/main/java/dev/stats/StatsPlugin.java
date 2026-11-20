@@ -1,9 +1,12 @@
 package dev.stats;
 
+import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.entity.Projectile;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
@@ -123,15 +126,47 @@ public class StatsPlugin extends JavaPlugin implements Listener {
         });
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR)
     public void onDeath(PlayerDeathEvent e) {
-        Player v = e.getEntity();
-        c(v.getUniqueId()).deaths.incrementAndGet();
-        Player k = v.getKiller();
-        if (k != null && !k.equals(v)) {
-            c(k.getUniqueId()).kills.incrementAndGet();
-            c(v.getUniqueId()).pvpDeaths.incrementAndGet();
+        Player victim = e.getEntity();
+        Player killer = victim.getKiller();
+
+        // stats counters
+        c(victim.getUniqueId()).deaths.incrementAndGet();
+        if (killer != null && !killer.equals(victim)) {
+            c(killer.getUniqueId()).kills.incrementAndGet();
+            c(victim.getUniqueId()).pvpDeaths.incrementAndGet();
         }
+
+        // kill log
+        EntityDamageEvent last = victim.getLastDamageCause();
+        final String cause = last != null ? last.getCause().name() : "UNKNOWN";
+        String kName = null, kUuid = null, weapon = null;
+        if (killer != null) {
+            kName = killer.getName();
+            kUuid = killer.getUniqueId().toString();
+            Material m = killer.getInventory().getItemInMainHand().getType();
+            weapon = m.isAir() ? "FIST" : m.name();
+        } else if (last instanceof EntityDamageByEntityEvent ed) {
+            var d = ed.getDamager();
+            if (d instanceof Projectile pr && pr.getShooter() instanceof org.bukkit.entity.Entity se) d = se;
+            kName = d.getType().name();
+        }
+        final String fk = kName, fu = kUuid, fw = weapon;
+        final String vn = victim.getName(), vu = victim.getUniqueId().toString();
+        final Location l = victim.getLocation();
+        final String world = l.getWorld().getName();
+        final int x = l.getBlockX(), y = l.getBlockY(), z = l.getBlockZ();
+        async(() -> {
+            try (Connection cn = conn();
+                 PreparedStatement ps = cn.prepareStatement(
+                         "INSERT INTO kill_log (killer_uuid,killer_name,victim_uuid,victim_name,weapon,cause,world,x,y,z) VALUES (?,?,?,?,?,?,?,?,?,?)")) {
+                ps.setString(1, fu); ps.setString(2, fk); ps.setString(3, vu); ps.setString(4, vn);
+                ps.setString(5, fw); ps.setString(6, cause); ps.setString(7, world);
+                ps.setInt(8, x); ps.setInt(9, y); ps.setInt(10, z);
+                ps.executeUpdate();
+            } catch (SQLException ex) { getLogger().warning("kill_log insert failed: " + ex.getMessage()); }
+        });
     }
 
     @EventHandler
@@ -204,6 +239,11 @@ public class StatsPlugin extends JavaPlugin implements Listener {
                     + "uuid CHAR(36) PRIMARY KEY, inventory_data LONGBLOB, inventory_text TEXT, "
                     + "enderchest_data LONGBLOB, enderchest_text TEXT, "
                     + "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+            st.executeUpdate("CREATE TABLE IF NOT EXISTS kill_log ("
+                    + "id BIGINT AUTO_INCREMENT PRIMARY KEY, killer_uuid CHAR(36) NULL, killer_name VARCHAR(64) NULL, "
+                    + "victim_uuid CHAR(36) NOT NULL, victim_name VARCHAR(16) NOT NULL, weapon VARCHAR(64) NULL, "
+                    + "cause VARCHAR(64) NOT NULL, world VARCHAR(64) NOT NULL, x INT, y INT, z INT, "
+                    + "at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX(at))");
         }
     }
 
